@@ -1,4 +1,5 @@
 import jax
+from tqdm import tqdm
 import jax.numpy as jnp
 import wandb
 from world.world import World
@@ -16,6 +17,7 @@ from world.world import World
 from visualizer import Visualizer
 import argparse
 from datetime import datetime
+from jax.random import split
 import os
 
 parser = argparse.ArgumentParser()
@@ -81,50 +83,71 @@ def gui_loop(world_state: WorldState, visualizer: Visualizer, world: World, conf
         pygame.display.flip()
         clock.tick(60)
 
+def rollout_simulation(rng, config):
+    world = World(config)
+    rng, _rng = split(rng)
+    world_state = world.initialize(_rng)
+    def world_scan():
+        return jax.lax.scan(world.step, world_state, None, config["NUM_WORLD_STEPS"])
+
+    out = jax.jit(world_scan)
+
 
 def main(config):
-    world = World(config)
+    # Create in_axes_init with all config keys set to None
+    
+    worlds = [World(config) for _ in range(config["POP_SIZE"])]
     now = str(datetime.now()).replace(" ", "_")
     render_dir = f"/tmp/renders/{now}"
 
     if args.render:
-        os.makedirs(render_dir, exist_ok=True)
-    visualizer = Visualizer(config)
+        for idx in range(config["POP_SIZE"]): # create a visualizer for each member of the population
+            os.makedirs(render_dir + f"/{idx}", exist_ok=True)
+    visualizers = [Visualizer(config) for _ in range(config["POP_SIZE"])]
 
     rng = jax.random.PRNGKey(config["INIT_RNG"])
-    world_state = world.initialize(rng)
+    rngs = jax.random.split(rng, config["POP_SIZE"])
+    world_states = [world.initialize(_rng) for world, _rng in zip(worlds, rngs)]
 
-    if config["GUI"]:
-        gui_loop(world_state, visualizer, world, config)
-        return
+    #if config["GUI"]: # TODO: fix this
+    #    gui_loop(world_state, visualizer, world, config)
+    #    return
+    def world_sim(world, world_state):
+        def world_scan(world_state):
+            return jax.lax.scan(world.step, world_state, None, config["NUM_WORLD_STEPS"])
+        
+        return jax.jit(world_scan)(world_state)
 
-    def world_scan(world_state):
-        return jax.lax.scan(world.step, world_state, None, config["NUM_WORLD_STEPS"])
-
+    print(jax.devices())
     for i in range(config["NUM_OUTER_STEPS"]):
-        out = jax.jit(world_scan)(world_state)
+        rollouts = []
+        print(f"Step {i}, devices: {jax.devices()}")
+        print(f"Length of worlds: {len(worlds)}, length of states: {len(world_states)}")
+        for idx in tqdm(range(config["POP_SIZE"])):
+            rollouts.append(world_sim(worlds[idx], world_states[idx]))
+        print(len(rollouts))
+        print(i)
 
         if args.render and i % config["RENDER_FREQ"] == 0:
-            fname = f"{render_dir}/{i:05d}.mp4"
-            print(f"RENDERING {fname}")
-            visualizer.render(out[1]["world_state"], fname=fname, show=False)
-            print(f"SAVING {fname}")
-            jnp.save(fname.replace(".mp4", ".npy"), world_state)
-            if args.wandb:
-                wandb.log({"video": wandb.Video(fname, fps=8, format="mp4")})
+            for idx, visualizer in enumerate(visualizers):
+                fname = f"{render_dir}/{idx}/{i:05d}.mp4"
+                print(f"RENDERING {fname}")
+                visualizer.render(rollouts[idx][1]["world_state"], fname=fname, show=False)
+                print(f"SAVING {fname}")
+                jnp.save(fname.replace(".mp4", ".npy"), world_states[idx])
+                if args.wandb:
+                    wandb.log({f"population/{i}/video-{idx}": wandb.Video(fname, fps=8, format="mp4")})
 
-        world_state = out[0]
-        metrics = {k: wandb.Histogram(v) for k, v in out[1].items() if not k.startswith("world_state")}
-        metrics_mean = {f"{k}_mean": v.mean() for k, v in out[1].items() if not k.startswith("world_state")}
-        metrics.update(metrics_mean)
-        metrics["num_agents_mode"] = jnp.argmax(jnp.bincount(out[1]["num_agents"].astype(jnp.int32)))
-        saliency = jax.jit(world.calc_saliency)(world_state)
-        metrics.update(saliency)
-        metrics["main/comm_saliency"] = saliency["agent_comm_2_saliency"]
+        world_states = [out[0] for out in rollouts]
+        metrics = {}
+        num_agents_list = [out[1]["num_agents"] for out in rollouts]
+        num_agents_mean = jnp.mean(jnp.array(num_agents_list))
+        metrics["num_agents_mean"] = num_agents_mean
+
         if args.wandb:
             wandb.log(metrics)
         print(i)
-        print(out[1]["num_agents"].mean())
+        print(metrics["num_agents_mean"])
 
     if args.wandb:
         wandb.finish()
@@ -140,6 +163,7 @@ if __name__ == "__main__":
         "AGENT_NUM_VIEW_AGENTS": args.num_agents // 8,
         "AGENT_NUM_VIEW_BOTS": 2,
         "CELL_SIZE": args.cell_size,
+        "POP_SIZE": 2,
         "TERRAIN_VIEW_RANGE": 4,
         "ACTION_REP_SIZE": 11,
         "FLATTEN_GRID_OBS": True,
